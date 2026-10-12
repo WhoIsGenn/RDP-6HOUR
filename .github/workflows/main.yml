@@ -1,68 +1,237 @@
-name: RDP
+name: CI
 on:
   workflow_dispatch:
+    inputs:
+      durasi_menit:
+        description: 'Durasi sesi (menit)'
+        required: false
+        default: '350'
+        type: choice
+        options:
+          - '30'
+          - '60'
+          - '120'
+          - '180'
+          - '240'
+          - '300'
+          - '350'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: ci-rdp
+  cancel-in-progress: false
 
 jobs:
-  secure-rdp:
-    runs-on: windows-2019
-    timeout-minutes: 3600
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      DUR: ${{ inputs.durasi_menit || '350' }}
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Setup dasar
+        shell: pwsh
+        timeout-minutes: 10
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          if (-not $env:RDP_PASSWORD -or $env:RDP_PASSWORD.Length -lt 8) {
+            Write-Host 'ERROR: RDP_PASSWORD belum di-set atau kurang dari 8 karakter.'; exit 1
+          }
 
-      - name: Create RDP User
+          # Matikan service tidak perlu (telemetry + superfetch)
+          foreach ($svc in @('SysMain', 'DiagTrack')) {
+            try {
+              $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+              if ($s) {
+                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
+                Write-Host "[CI] $svc dihentikan."
+              }
+            } catch {}
+          }
+
+          # Aktifkan RDP — jangan sentuh WinStations\RDP-Tcp
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          # Token admin penuh untuk login jaringan/RDP
+          reg add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f | Out-Null
+
+          # Firewall — hanya izinkan dari range Tailscale
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -Name 'RemoteDesktop-*' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
+
+          # Pastikan service RDP jalan
+          Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Write-Host '[CI] RDP port 3389 aktif.'
+
+      - name: Konfigurasi user
+        shell: pwsh
+        timeout-minutes: 5
         run: |
-          $username = "shinn"
-          $password = "shinnxyz"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          if (-not (Get-LocalUser -Name $username)) { exit 1 }
+          $u = 'shinn'
+          $sp = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $u -Password $sp -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+          } else {
+            New-LocalUser -Name $u -Password $sp -AccountNeverExpires -PasswordNeverExpires `
+              -Description 'RDP user' | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Administrators'       -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $u -ErrorAction SilentlyContinue
+
+          Write-Host "[CI] User '$u' siap."
 
       - name: Install Tailscale
+        shell: pwsh
+        timeout-minutes: 10
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $work = 'C:\ProgramData\CI\access'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $msi = Join-Path $work 'tailscale.msi'
 
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $msi -UseBasicParsing
+
+          # Verifikasi signature sebelum install
+          $sig = Get-AuthenticodeSignature $msi
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Tailscale') {
+            Write-Host 'ERROR: Signature installer Tailscale tidak valid.'; exit 1
           }
-          if (-not $tsIP) { exit 1 }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { exit 1 }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: shinn"
-          Write-Host "Password: shinnxyz"
-          Write-Host "==================`n"
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active"
-              Start-Sleep -Seconds 300
+          $log = Join-Path $work 'ts-install.log'
+          $p = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$log`"" -PassThru -Wait
+          if ($p.ExitCode -notin @(0, 3010)) {
+            Write-Host "ERROR: Installer exit $($p.ExitCode)"; exit 1
           }
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+          Write-Host '[CI] Tailscale terpasang.'
+
+      - name: Sambungkan Tailscale
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "runner-$env:GITHUB_RUN_NUMBER"
+
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          & $exe up `
+            "--auth-key=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$hostname" `
+            '--ephemeral' `
+            '--accept-dns=false' `
+            '--timeout=90s'
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'ERROR: Tailscale gagal connect. Cek auth key.'; exit 1
+          }
+
+          $ip = $null; $retries = 0
+          while (-not $ip -and $retries -lt 15) {
+            Start-Sleep -Seconds 5
+            $ip = (& $exe ip -4 2>$null)
+            $retries++
+          }
+          if (-not $ip) { Write-Host 'ERROR: Tidak dapat IP Tailscale.'; exit 1 }
+
+          # Kunci firewall ke Tailscale range
+          Get-NetFirewallRule -Name 'RemoteDesktop-*' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
+
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "[CI] Tailscale siap: $ip"
+
+      - name: Verifikasi RDP
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $deadline = (Get-Date).AddSeconds(60)
+          $ok = $false
+          do {
+            $r = Test-NetConnection -ComputerName $env:TS_IP -Port 3389 -WarningAction SilentlyContinue
+            if ($r.TcpTestSucceeded) { $ok = $true; break }
+            Start-Sleep -Seconds 5
+          } while ((Get-Date) -lt $deadline)
+
+          if (-not $ok) { Write-Host 'ERROR: Port 3389 tidak merespons.'; exit 1 }
+          Write-Host "[CI] RDP siap di $($env:TS_IP):3389"
+
+      - name: Info koneksi
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          Write-Host '=== INFO KONEKSI ==='
+          Write-Host "Address  : $env:TS_IP`:3389"
+          Write-Host 'Username : shinn'
+          Write-Host 'Password : (lihat secret RDP_PASSWORD)'
+          Write-Host '===================='
+
+      - name: Tahan sesi
+        shell: pwsh
+        run: |
+          $dur = [int]($env:DUR -replace '\D', '')
+          if ($dur -lt 10 -or $dur -gt 350) { $dur = 350 }
+          $stop = (Get-Date).AddMinutes($dur)
+
+          while ((Get-Date) -lt $stop) {
+            $left = $stop - (Get-Date)
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Aktif — sisa $($left.ToString('hh\:mm'))"
+            Start-Sleep -Seconds 60
+          }
+          Write-Host '[CI] Durasi selesai.'
+
+      - name: Finalize
+        if: always()
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          # Logout Tailscale
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $exe) {
+            try { & $exe down 2>$null | Out-Null } catch {}
+            try { & $exe logout 2>$null | Out-Null } catch {}
+          }
+
+          # Hapus run lama, simpan 3 terbaru
+          $repo = $env:GITHUB_REPOSITORY
+          $tok  = $env:GITHUB_TOKEN
+          $wf   = 'rdp.yml'
+          $keep = 3
+          if ($repo -and $tok) {
+            try {
+              $hdrs = @{
+                Authorization          = "Bearer $tok"
+                Accept                 = 'application/vnd.github+json'
+                'User-Agent'           = 'CI'
+                'X-GitHub-Api-Version' = '2022-11-28'
+              }
+              $runs = Invoke-RestMethod `
+                -Uri "https://api.github.com/repos/$repo/actions/workflows/$wf/runs?per_page=100" `
+                -Headers $hdrs -TimeoutSec 30
+              $old = @($runs.workflow_runs) | Select-Object -Skip $keep
+              foreach ($r in $old) {
+                if ($r.status -in @('in_progress', 'queued')) { continue }
+                try {
+                  Invoke-RestMethod -Method Delete `
+                    -Uri "https://api.github.com/repos/$repo/actions/runs/$($r.id)" `
+                    -Headers $hdrs -TimeoutSec 30 | Out-Null
+                  Write-Host "[CI] Run #$($r.run_number) dihapus."
+                } catch {}
+              }
+            } catch { Write-Host "[CI] Cleanup run lama dilewati: $($_.Exception.Message)" }
+          }
+          Write-Host '[CI] Selesai.'
